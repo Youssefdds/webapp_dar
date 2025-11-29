@@ -228,48 +228,142 @@ def fetch_all_terms():
 
 
 all_books_terms = fetch_all_terms()
+
 def build_graph_from_books():
     print("📘 Construction du graphe depuis Django Book...")
 
     books = Book.objects.all()
     graph = {}
 
-    # Initialisation des nœuds
+    # Préparer les sets de mots pour chaque livre
+    book_words = {}
     for book in books:
+        words = set(book.title.lower().split())  # on peut étendre au texte complet si disponible
+        words = {w for w in words if len(w) > 3}
+        book_words[book.id] = words
         graph[book.id] = set()
 
+    # Calculer similarité Jaccard et créer les liens
     for b1 in books:
-        title1_words = {w for w in b1.title.lower().split() if len(w) > 3}
-
         for b2 in books:
-            if b1.id == b2.id:
+            if b1.id >= b2.id:
+                continue  # éviter doublons et auto-lien
+
+            # Similarité Jaccard
+            w1, w2 = book_words[b1.id], book_words[b2.id]
+            if not w1 or not w2:
                 continue
+            intersection = len(w1 & w2)
+            union = len(w1 | w2)
+            jaccard = intersection / union if union > 0 else 0
 
-            # Critère 1 : même auteur (si présent)
-            same_author = b1.author and b1.author == b2.author
-
-            # Critère 2 : mots en commun dans le titre
-            title2_words = {w for w in b2.title.lower().split() if len(w) > 3}
-            shared_words = title1_words.intersection(title2_words)
-
-            if same_author or len(shared_words) > 0:
+            if jaccard > 0.1:  # seuil de similarité
                 graph[b1.id].add(b2.id)
+                graph[b2.id].add(b1.id)
 
-    # Sets → lists
+    # Convert sets → lists pour JSON
     graph = {str(k): list(v) for k, v in graph.items()}
-
     GRAPH_FILE.write_text(json.dumps(graph), encoding="utf-8")
     print("✅ Graphe sauvegardé dans", GRAPH_FILE)
 
     return graph
 
+
 def load_graph():
     if GRAPH_FILE.exists():
         return json.loads(GRAPH_FILE.read_text(encoding="utf-8"))
-    else :
-        build_graph_from_books()
-    return {}
+    else:
+        return build_graph_from_books()
 
+
+# -------------------------
+# Calcul de centralité manuelle
+# -------------------------
+def compute_centrality_for_ids(book_ids, method="closeness"):
+    graph_data = load_graph()
+    # Construire le graphe complet comme dict[int, set[int]]
+    full_graph = {int(k): set(v) for k, v in graph_data.items()}
+
+    # Nombre de nœuds total dans le graphe (pour normalisation)
+    N_total = len(full_graph)
+
+    centrality_scores = {}
+
+    if method == "closeness":
+        for node in book_ids:
+            node = int(node)
+            if node not in full_graph:
+                centrality_scores[node] = 0
+                continue
+
+            # distances dans la composante de `node` (BFS sur le graphe complet)
+            distances = bfs_distances(full_graph, node)  # dict {n: dist}
+            reachable = len(distances)  # inclut node lui-même
+
+            if reachable <= 1:
+                centrality_scores[node] = 0
+                continue
+
+            # somme des distances vers tous les autres noeuds atteignables
+            total_dist = sum(distances.values())
+
+            if total_dist <= 0:
+                centrality_scores[node] = 0
+                continue
+
+            # closeness "raw" sur la composante : (reachable-1) / sumdist
+            raw = (reachable - 1) / total_dist
+
+            # normalisation pour graphe disconnexe (comme NetworkX)
+            # multiplie par (reachable-1)/(N_total-1) pour tenir compte de la taille globale
+            if N_total > 1:
+                norm = raw * ((reachable - 1) / (N_total - 1))
+            else:
+                norm = 0.0
+
+            centrality_scores[node] = norm
+
+    elif method == "betweenness":
+        # placeholder simple (tu peux remplacer par une version exacte)
+        centrality_scores = {int(n): 0 for n in book_ids if int(n) in full_graph}
+
+    elif method == "pagerank":
+        # PageRank calculé sur le graphe complet ; on renvoie seulement les ids demandés
+        pr = pagerank({k: v for k, v in full_graph.items()})
+        centrality_scores = {int(n): pr.get(int(n), 0.0) for n in book_ids}
+
+    else:
+        centrality_scores = {int(n): 0 for n in book_ids if int(n) in full_graph}
+
+    return centrality_scores
+    
+def bfs_distances(graph, start):
+    visited = {start: 0}
+    queue = [start]
+    while queue:
+        node = queue.pop(0)
+        for neighbor in graph.get(node, []):
+            if neighbor not in visited:
+                visited[neighbor] = visited[node] + 1
+                queue.append(neighbor)
+    return visited
+
+
+def pagerank(graph, d=0.85, max_iter=20):
+    N = len(graph)
+    ranks = {node: 1/N for node in graph}
+    for _ in range(max_iter):
+        new_ranks = {}
+        for node in graph:
+            rank_sum = sum(ranks[neighbor] / len(graph[neighbor]) for neighbor in graph if node in graph[neighbor])
+            new_ranks[node] = (1 - d)/N + d * rank_sum
+        ranks = new_ranks
+    return ranks
+
+
+# -------------------------
+# Vues Django REST
+# -------------------------
 @api_view(["GET"])
 def get_suggestions(request):
     book_id = request.GET.get("id")
@@ -277,9 +371,7 @@ def get_suggestions(request):
         return Response({"error": "Missing id parameter"}, status=400)
 
     graph = load_graph()
-    print("Graph loaded with", len(graph), "nodes.")
-    suggestions = graph.get(book_id, [])  # ici on suppose que graph a la forme {book_id: [suggestions_ids]}
-    print(f"Suggestions for book {book_id}:", suggestions)
+    suggestions = graph.get(book_id, [])
     books = []
     for s_id in suggestions:
         try:
@@ -292,44 +384,8 @@ def get_suggestions(request):
             })
         except Book.DoesNotExist:
             continue
-    print("Returning .", books)
-    ref=Book.objects.get(id=book_id)
-    return Response({"id": book_id,"title": ref.title, "results": books})
-
-   
-    # book_id = request.GET.get("id")
-    # if not book_id:
-    #     return JsonResponse({"error": "Missing id"}, status=400)
-    
-    # global GRAPH_GLOBAL, SUGGESTIONS_GLOBAL
-
-    # book_id = int(book_id)
-
-    # if book_id not in SUGGESTIONS_GLOBAL:
-    #     return JsonResponse({"error": "Book not in graph"}, status=404)
-
-    # neighbors = SUGGESTIONS_GLOBAL[book_id]
-
-    # books = Book.objects.filter(id__in=[book_id] + neighbors)
-    # books_dict = {b.id: b for b in books}
-
-    # data = {
-    #     "id": book_id,
-    #     "title": books_dict[book_id].title,
-    #     "author": books_dict[book_id].author,
-    #     "image_url": books_dict[book_id].image_url,
-    #     "suggestions": [
-    #         {
-    #             "id": books_dict[n].id,
-    #             "title": books_dict[n].title,
-    #             "author": books_dict[n].author,
-    #             "image_url": books_dict[n].image_url,
-    #         }
-    #         for n in neighbors if n in books_dict
-    #     ]
-    # }
-    
-    # return JsonResponse(data)
+    ref = Book.objects.get(id=book_id)
+    return Response({"id": book_id, "title": ref.title, "results": books})
 
 
 @api_view(["GET"])
@@ -341,58 +397,20 @@ def enhanced_search(request):
     centrality_enabled = request.GET.get("centrality", "false").lower() == "true"
 
     if not pattern:
-        return JsonResponse({
-            "page": page,
-            "size": size,
-            "total": 0,
-            "results": []
-        })
+        return JsonResponse({"page": page, "size": size, "total": 0, "results": []})
 
-    # Appel direct de la logique de recherche
     data = perform_search_logic(pattern, page=page, size=size, regex=regex_mode)
 
     ids = [r["id"] for r in data["results"] if r["id"]]
 
-    # Calculer la centralité si demandé
     if centrality_enabled and ids:
         centrality_scores = compute_centrality_for_ids(ids)
         for r in data["results"]:
             bid = r["id"]
             r["score"] = r.get("score", 0) + centrality_scores.get(bid, 0)
-
-        # Tri final
         data["results"].sort(key=lambda x: -x.get("score", 0))
 
     return JsonResponse(data)
-
-def compute_centrality_for_ids(book_ids, method="closeness"):
-    """
-    Calcule la centralité pour une liste de book_ids.
-    method: 'pagerank', 'closeness' ou 'betweenness'
-    Retourne un dict {book_id: centrality_score}
-    """
-    graph_data = load_graph()  # graphe déjà sauvegardé
-    G = nx.Graph()
-    for k, v in graph_data.items():
-        G.add_node(int(k))
-        for neighbor in v:
-            G.add_edge(int(k), int(neighbor))
-
-    # Filtrer pour book_ids seulement si besoin
-    sub_G = G.subgraph(book_ids) if book_ids else G
-
-    if method == "pagerank":
-        centrality_scores = nx.pagerank(sub_G)
-    elif method == "closeness":
-        centrality_scores = nx.closeness_centrality(sub_G)
-    elif method == "betweenness":
-        centrality_scores = nx.betweenness_centrality(sub_G)
-    else:
-        centrality_scores = {bid: 0 for bid in book_ids}
-
-    # Convertir keys en int pour matcher avec les IDs
-    centrality_scores = {int(k): v for k, v in centrality_scores.items()}
-    return centrality_scores
 
 def perform_search_logic(query, page=1, size=10, regex=False):
     """

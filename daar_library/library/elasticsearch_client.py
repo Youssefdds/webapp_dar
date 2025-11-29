@@ -1,7 +1,7 @@
 from elasticsearch import Elasticsearch
 
 es = Elasticsearch(
-    hosts=["http://elasticsearch1:9200"],
+    hosts=["http://localhost:9200"],
     request_timeout=60,   # augmente le timeout
     retry_on_timeout=True,
     max_retries=10,
