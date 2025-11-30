@@ -1,4 +1,4 @@
-# DAAR Library – Setup Guide
+# Gutenberg Library – Setup Guide
 
 ## 1. Create and activate the virtual environment
 ```bash
